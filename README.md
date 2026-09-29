@@ -217,6 +217,8 @@ Around the database:
 
 ## 11. Privacy and security
 
+![Privacy and security](docs/diagrams/11-privacy-security.png)
+
 - **Authentication.** Every API call carries a Cognito JWT, which FastAPI verifies against Cognito's JWKS before doing any work.
 - **Bedrock access.** Calls to Claude on Amazon Bedrock are signed with AWS IAM credentials that live only in the backend's environment, never in the mobile app.
 - **Per-farmer isolation.** Every database row, memory and image is scoped by `user_id`. One farmer's data or memories are never returned for another farmer.

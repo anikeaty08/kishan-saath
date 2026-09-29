@@ -44,8 +44,9 @@ Saathi can also start the conversation: an outbound call for a rain alert or a t
 - **Clients.** The Flutter app (text, photo, voice) and a normal phone call.
 - **Managed identity and voice.** AWS Cognito issues JWTs; ElevenLabs runs the voice agent (speech-to-text, text-to-speech, calls).
 - **Backend (Docker on Render).** FastAPI checks each token against Cognito's JWKS, then hands chat, diagnosis and voice turns to the Saathi Agent. The agent works through a tool and data layer that wraps both neural networks.
-- **External APIs.** Claude on Amazon Bedrock, called through the Anthropic SDK and authenticated with AWS IAM, for reasoning and language; the OpenWeather API; and Tavily web search.
+- **External APIs.** Claude on Amazon Bedrock, called through the Anthropic SDK and authenticated with AWS IAM, for reasoning and language; OpenWeather and Open-Meteo for weather; Nominatim and Open-Meteo geocoding to turn a farmer's location into coordinates; and Tavily web search.
 - **Data layer.** Mem0 memory, Supabase PostgreSQL (schema managed by Alembic), and Cloudinary for private leaf images. All data is scoped per farmer.
+- **Background workers.** Memory capture turns saved conversations into Mem0 memories (Supabase → Mem0). Report retention deletes old reports from Supabase. Object cleanup removes orphaned rows from Supabase along with their Cloudinary files.
 
 ---
 
@@ -63,7 +64,7 @@ The Saathi Agent is the orchestrator. The neural networks and APIs are tools it 
 3. Call those tools, in parallel where possible.
 4. Read the results. If there is not enough to answer, plan again.
 5. Compose the answer in simple words, in the farmer's language, with a safety check.
-6. Save new memories and the chat history.
+6. Save the chat history. The memory capture worker later turns it into Mem0 memories.
 
 **Tools.**
 
@@ -71,10 +72,11 @@ The Saathi Agent is the orchestrator. The neural networks and APIs are tools it 
 |---|---|
 | `diagnose_leaf` | Leaf disease neural network |
 | `compare_defect` | Defect image comparison model |
-| `live_weather` | OpenWeather API (now) |
-| `forecast` | OpenWeather API (next 7 days) |
+| `geocode` | Nominatim, Open-Meteo geocoding |
+| `live_weather` | OpenWeather, Open-Meteo (now) |
+| `forecast` | OpenWeather, Open-Meteo (next 7 days) |
 | `web_search` | Tavily |
-| `memory` search / add | Mem0 |
+| `memory` search | Mem0 (written by the memory capture worker) |
 | `crop_profile` | Supabase (plot, crop, history) |
 
 A photo question needs the vision models; a sowing question needs weather and memory. Claude picks only what the question needs, using tool calling through the Anthropic SDK.
@@ -107,7 +109,7 @@ There are two memory scopes:
 | Global farmer memory | `user_id` | Prefers Hindi voice replies; farms 2 acres with drip irrigation |
 | Crop memory | `user_id` + `crop_id` | Tomato sown mid-June; early blight found in August; copper spray, improving |
 
-- **Write path (after each turn).** A Claude-based extractor keeps lasting facts, drops chit-chat, and routes each fact to the right scope.
+- **Write path (memory capture worker).** Each conversation is saved to Supabase first. The memory capture worker then reads it, uses Claude to keep lasting facts and drop chit-chat, and writes each fact to the right scope in Mem0.
 - **Read path (before answering).** Both scopes are searched, the top memories are ranked and merged, and they are added to the agent's context.
 - **Mem0 vs Supabase.** Mem0 holds short facts the agent recalls by meaning. Supabase holds the full record: chats, diagnoses, crops, plots.
 
@@ -156,6 +158,11 @@ Around the database:
 - **Cloudinary** stores the actual image files. Postgres keeps only the private `public_id`.
 - **Mem0** stores memories tagged with `user_id` and `crop_id`.
 
+Background workers keep the data tidy:
+- **Object cleanup** removes orphaned rows and their Cloudinary files.
+- **Report retention** deletes reports once they pass the retention period.
+- **Memory capture** reads saved conversations and writes memories to Mem0.
+
 ---
 
 ## 8. Deployment and infrastructure
@@ -165,10 +172,10 @@ Around the database:
 - A push to the Git repository auto-deploys on Render.
 - Render builds the Dockerfile into a container image.
 - The pre-deploy command runs `alembic upgrade head` to migrate Supabase.
-- The web service runs one container: uvicorn + FastAPI, the Saathi Agent, and the weights for the leaf disease model and the comparison model.
+- The web service runs one container: uvicorn + FastAPI, the Saathi Agent, the background workers (object cleanup, report retention, memory capture), and the weights for the leaf disease model and the comparison model.
 - Secrets are injected as environment variables at start: the Cognito pool, the AWS IAM credentials used for Bedrock, the other API keys, and the database URL.
 - The Flutter app talks to the service over HTTPS at the Render URL. ElevenLabs calls back into the voice webhook on the same service.
-- Everything else is a managed service: AWS Cognito, ElevenLabs, Amazon Bedrock (Claude), OpenWeather, Tavily, Mem0, Cloudinary, Supabase PostgreSQL.
+- Everything else is a managed service: AWS Cognito, ElevenLabs, Amazon Bedrock (Claude), OpenWeather, Open-Meteo, Nominatim, Tavily, Mem0, Cloudinary, Supabase PostgreSQL.
 
 ---
 
@@ -184,10 +191,11 @@ Around the database:
 6. The agent recalls farmer and crop facts from Mem0.
 7. The agent calls `diagnose_leaf`.
 8. The leaf model fetches the image from Cloudinary through a signed URL and returns a disease and confidence.
-9. The agent asks OpenWeather for the forecast (for example, rain in the next 48 hours).
-10. Claude on Bedrock writes the advice in the farmer's language, and the agent adds a new memory.
-11. The agent saves the diagnosis and message to Supabase.
-12. FastAPI returns the advice (text + audio), and the app shows it and speaks it.
+9. The agent asks OpenWeather / Open-Meteo for the forecast (for example, rain in the next 48 hours).
+10. Claude on Bedrock writes the advice in the farmer's language, and the agent saves the diagnosis and message to Supabase.
+11. FastAPI returns the advice (text + audio), and the app shows it and speaks it.
+
+Afterwards, the memory capture worker reads the saved conversation from Supabase and updates Mem0.
 
 ---
 
@@ -208,7 +216,8 @@ Around the database:
 | Voice and calls | ElevenLabs | Speech-to-text, text-to-speech, inbound and outbound calls |
 | Memory | Mem0 | Global farmer memory and per-crop memory |
 | Web search | Tavily | Fresh farming information |
-| Weather | OpenWeather API | Live conditions and forecast |
+| Weather | OpenWeather, Open-Meteo | Live conditions and forecast |
+| Geocoding | Nominatim, Open-Meteo geocoding | Farmer's location to coordinates |
 | Database | Supabase PostgreSQL + Alembic | Records and schema migrations |
 | Images | Cloudinary | Private leaf photos |
 | Deploy | Docker + Render | One container, auto-deploy |
@@ -224,6 +233,7 @@ Around the database:
 - **Per-farmer isolation.** Every database row, memory and image is scoped by `user_id`. One farmer's data or memories are never returned for another farmer.
 - **Private images.** Leaf photos are private Cloudinary assets, read only through short-lived signed URLs. Postgres stores ids, not images.
 - **Secrets.** API keys, IAM credentials and database credentials live in Render environment variables, never in the app or the repository.
+- **Nothing kept forever.** The report retention worker deletes old reports, and the object cleanup worker removes orphaned photos and their rows.
 - **Safe advice.** The agent's compose step includes a safety check, and low-confidence diagnoses ask for a better photo instead of guessing.
 
 ---
@@ -246,8 +256,8 @@ Around the database:
 
 **Phase 3: Saathi Agent**
 - Agent loop on Claude through the Anthropic SDK, hosted on Amazon Bedrock with AWS IAM auth.
-- Tools: OpenWeather (live + forecast), Tavily search, crop profile.
-- Mem0 global and per-crop memory, with read and write paths.
+- Tools: OpenWeather and Open-Meteo (live + forecast), Nominatim / Open-Meteo geocoding, Tavily search, crop profile.
+- Mem0 global and per-crop memory, written by the memory capture worker.
 - Conversations and messages, with replies in the farmer's language.
 
 **Phase 4: Voice and calling**
@@ -258,5 +268,6 @@ Around the database:
 
 **Phase 5: Hardening**
 - Privacy review of per-farmer scoping across database, Mem0 and Cloudinary.
+- Object cleanup and report retention workers.
 - Model evaluation, versioning and confidence tuning.
 - Monitoring and logging on Render.

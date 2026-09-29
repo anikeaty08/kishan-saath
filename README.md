@@ -228,6 +228,8 @@ Around the database:
 
 ## 12. Build plan
 
+![Build plan](docs/diagrams/12-build-plan.png)
+
 **Phase 1: Foundation**
 - Flutter app shell with Cognito sign-up and login.
 - FastAPI service with the JWT auth guard.
